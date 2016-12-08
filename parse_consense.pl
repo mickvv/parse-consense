@@ -6,7 +6,11 @@ use autodie;
 use Smart::Comments '###';
 use Getopt::Euclid qw( :vars );
 
+use File::Spec;
+use List::Compare;
 use File::Basename;
+use List::AllUtils 'apply';
+use File::Find::Rule;
 use Path::Class 'file', 'dir';
 
 use Bio::MUST::Core;
@@ -83,7 +87,6 @@ for my $serie_dir (@series_dir) {
     # Parse output files from consense...
     # ...data structures:
     my @results;
-    my $spec_hash;
     my $spec_n = 0;
     my $factor = 0.0;
 
@@ -94,13 +97,15 @@ for my $serie_dir (@series_dir) {
         #-------------------------------------------------------------------------------
         # custom filter to remove when final run
         #-------------------------------------------------------------------------------
-        next unless $infile =~ m/copy\-20/xmsg;
+#        next unless $infile =~ m/copy\-20/xmsg;
 #        next unless $infile =~ m/OG\d+599/xmsg;
         ### Processing: $infile
      
         # counter for bipartitions
         my $bip;
+        my %seq_for;
         my %deja_vu;
+        my %seq_id_for;
      
         my ($OG, $serie, $ref_mul) = $infile =~ m/ (OG\d+) ([\w\-]+) - (\d \.? \d?)/xmsg;
         my ($pres, $copies) = get_batch($infile);
@@ -132,13 +137,22 @@ for my $serie_dir (@series_dir) {
             if ($line =~ /^\s*(\d+)\.\s+(\S+.*)$/) {
                 my $index = $1;
                 my $spec = $2;
-                $spec =~ s/_{2,}//g;
-                $spec =~ s/ /_/g;			# replace spaces by underscores
-                $spec_hash->{$index} = $spec;
+                   $spec =~ s/ /_/g;			# replace spaces by underscores
+                
+                my $seq_id = SeqId->new( full_id => $spec );
+                
+                my $group = $classifier->classify($seq_id) // 'unknown';
+                say join "\t", 'OHOHOHOH', $spec unless $group;
+                
+                $seq_id_for{$seq_id->full_id}{seq_id} = $seq_id;
+                $seq_id_for{$seq_id->full_id}{group}  = $group;
+                $seq_for{$index}{seq_id}   = $seq_id;
+                $seq_for{$index}{group}    = $group;
+                
                 next LINE;
             }
             
-            # process bipartitions
+            # pro ':all'cess bipartitions
             my @indexes;
             if ($line =~ /^((\.|\*).*?)(\d+\.\d+)$/) {
                 my $boot = $3;
@@ -160,6 +174,7 @@ for my $serie_dir (@series_dir) {
         }
         close $in;
      
+        
         # sort bipartitions from the most balanced to the less
         my @bips = sort { $delta_for{$a} <=> $delta_for{$b} } keys %delta_for;
         # my @vals = @delta_for{@keys};
@@ -173,17 +188,14 @@ for my $serie_dir (@series_dir) {
             MONO:
             for my $idxs ( ($dots_idxs, $stars_idxs) ) {
                 ### Computing monopartition
-                # identify species in %spec_hash and create corresponding SeqId objects  
-                ### $idxs
+                
                 my $size = @$idxs;
                 ### $size
-                my @seq_ids = map { SeqId->new( full_id => $_ ) } 
-                              map { $spec_hash->{$_} } @$idxs
-                            ;
-#                ### @seq_ids
-                ### seq_ids: map { $_->full_id } @seq_ids
-                
-                my @groups = map { $classifier->classify($_) } @seq_ids;
+                my @seq_ids = map { $seq_for{$_}{seq_id} } @$idxs;
+                my @groups  = map { $seq_for{$_}{group}  } @$idxs;
+                ### $idxs
+                ### @groups
+             
                 # skip partitions not containing any org from the considered 
                 # group (i.e. orgs belonging to removed group)
                 next MONO unless grep { $_ eq $serie } @groups; 
@@ -195,7 +207,7 @@ for my $serie_dir (@series_dir) {
                
                     # skip partition with already processed organisms
                     next MONO unless grep { ! $deja_vu{$_->full_id} } @seq_ids;
-
+                    
                     my $is_genomic = _is_genomic(@seq_ids);
                     my $groups_st  = _groups_st(@groups);
                     ### scenario: [$is_genomic, $groups_st]
@@ -237,10 +249,9 @@ for my $serie_dir (@series_dir) {
                 # skip partition if not unique species
                 next MONO if grep { $_ ne $ref_org } @orgs;
                 say 'YOU WIN ! \o/';
-                my @isnt_new;
-                @isnt_new = grep { ! $_->is_new } @seq_ids;
-                ### isnt_new: map { $_->full_id } @isnt_new
-                my $inc = @isnt_new;
+                my @is_new = grep { $_->is_new } @seq_ids;
+                ### is_new: map { $_->full_id } @is_new
+                my $inc = @is_new;
                 ### $inc
                 $data_for{$OG}{$serie}{$pres}{$copies}{$ref_mul}{TP} += $inc;
                 ### %data_for
@@ -248,92 +259,34 @@ for my $serie_dir (@series_dir) {
                 $deja_vu{$_->full_id}++ for @seq_ids; 
             }
         }
+
+        # last FPs/FNs
+        my @deja_vus = keys %deja_vu;
+        ### @deja_vus
+        my @full_ids = grep { $seq_id_for{$_}{group} eq $serie } keys %seq_id_for;
+        ### %seq_id_for
+#        ### keys: keys %seq_id_for
+        ### @full_ids
+        
+        my $lc = List::Compare->new(\@full_ids, \@deja_vus);
+#        my $lc = List::Compare->new(\@full_ids, \@deja_vus);
+        my @unique = $lc->get_unique;
+        ### @unique
+
+        $data_for{$OG}{$serie}{$pres}{$copies}{$ref_mul}{$_}++ for map { $_->is_new ? 'FP' : 'FN' } 
+                                                                   map { $seq_id_for{$_}{seq_id}  } @unique
+                                                                   ;
+                                                                   ### %data_for
+    
+#        $data_for{$OG}{$serie}{$pres}{$copies}{$ref_mul}{FN}++ # prot
+#        $data_for{$OG}{$serie}{$pres}{$copies}{$ref_mul}{FP}++ # genomic
+
+
         ### %data_for
         ### %deja_vu
+        ### groups: map { $seq_id_for{$_}{group} } keys %seq_id_for
     }
 }
-
-#            my @dots_seq_ids  = map { SeqId->new( full_id => $_ ) } 
-#                                map { $spec_hash->{$_} } @indexes
-#                              ;
-#            my @stars_seq_ids = map { SeqId->new( full_id => $_ ) } 
-#                                map { $spec_hash->{$_} } @indexes
-#                              ;
-#            ### $dots_idxs
-#            ### $stars_idxs
-##        ### @seq_ids
-##        ### seq_ids: map { $_->full_id } @seq_ids
-#
-#            my @dots_groups = map { $classifier->classify($_) } @dots_seq_ids;
-#            next PART unless grep { $_ eq $serie } @dots_groups;
-#            ### @groups
-#            ### $serie
-
-
-
-
-                
-
-
-            # process a bipartition line
-#            my @indexes = ();
-#            if ($line =~ /^((\.|\*).*?)(\d+\.\d+)$/) {
-#                my $boot = $3;
-#                # skip bipartitions with a bootstrap <= 50
-#                next LINE unless $boot > 50; 
-#
-#                my $bips = $1;
-#                   $bips =~ s/ //g;			# remove spaces
-#                my $size = $bips =~ tr/*//; # compute bipartition size
-#                next unless $size == 2;     # consider only bipartitions of size = 2  
-##                ### $bips
-##                ### $size
-#
-#                # compute indexes for bipartition to identify species in %spec_hash
-#                my $offset = 0;
-#                my $star   = '*';
-#                my $index  = index($bips, $star, $offset);
-#                push @indexes, ++$index;
-#                $offset = $index;
-#                $index  = index($bips, $star, $offset);
-#                push @indexes, ++$index;
-##               ### @indexes
-#
-#                # identify species thanks to indexes and create a SeqId object on 
-#                # the fly
-#                my @seq_ids = map { SeqId->new( full_id => $_ )} 
-#                              map { $spec_hash->{$_} } @indexes
-#                              ;
-##               ### @seq_ids
-#               ### seq_ids: map { $_->full_id } @seq_ids
-#                
-#                # identify taxonomic groups and continue only if at least one is the 
-#                # same as the removed seqs
-#                my @groups = map { $classifier->classify($_) } @seq_ids;
-#                next unless grep { $_ eq $serie } @groups;
-##               ### @groups
-##               ### $serie
-#                $bip++;
-#
-#                # identify scenario
-#                # test if one, both or no seqs are from genomic data...
-#                # .. and if groups are identical or not
-#                my $is_genomic = _is_genomic(@seq_ids);
-#                my $groups_st = _groups_st(@groups);
-#                ### scenario: [$is_genomic, $groups_st]
-#                if ($is_genomic eq 'none') {
-#
-#                    my $rep = $groups_st eq 'same' ? 2 : 1;
-#                    $data_for{$OG}{$serie}{$pres}{$copies}{$ref_mul}{FN}++ for 1 .. $rep;  
-##                    ### FN: $data_for{$OG}{$serie}{$pres}{$copies}{$ref_mul}{FN}
-#                    next LINE;
-#                }
-#             
-#                $data_for{$OG}{$serie}{$pres}{$copies}{$ref_mul}{TP}++ if $is_genomic eq 'one'  && $groups_st eq 'same';
-#                $data_for{$OG}{$serie}{$pres}{$copies}{$ref_mul}{FP}++ if $is_genomic eq 'one'  && $groups_st eq 'diff';
-#                $data_for{$OG}{$serie}{$pres}{$copies}{$ref_mul}{FP} += 2 if $is_genomic eq 'both' && $groups_st eq 'same';
-#            }
-#    ### Processed bipartitions: $bip
 
         #pour l'arbre X, for each org à ajouter
         #for each bipar 
@@ -421,7 +374,9 @@ sub change_path {
 
     my ($filename, $directories) = fileparse($infile);
     # path::class::file
-    my @wanted_directories = File::Spec->catdir(splice [split "/", $directories], -$level)
+
+    my @dirs = split "/", $directories;
+    my @wanted_directories = File::Spec->catdir(splice @dirs, -$level)
         if $level;
 
     my $outfile = file($new_directories ? $new_directories : '.', 
